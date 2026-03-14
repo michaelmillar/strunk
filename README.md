@@ -1,4 +1,6 @@
 <p align="center">
+  <img src="assets/icon.svg" alt="strunk icon" width="120"/>
+  <br/><br/>
   <img src="assets/logo.svg" alt="strunk" width="500"/>
 </p>
 
