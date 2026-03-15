@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 200" width="600" height="200">
+  <defs>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e8590c;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#d9480f;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="600" height="200" rx="12" fill="#1a1b26"/>
+  <text x="40" y="125" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="72" font-weight="700" fill="#c0caf5" letter-spacing="-2">strunk</text>
+  <rect x="295" y="70" width="4" height="60" rx="2" fill="url(#accent)"/>
+  <text x="316" y="105" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="18" fill="#565f89">omit needless</text>
+  <text x="316" y="128" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="18" fill="#565f89">infrastructure</text>
+  <rect x="40" y="155" width="50" height="6" rx="3" fill="#e8590c" opacity="0.8"/>
+  <rect x="100" y="155" width="35" height="6" rx="3" fill="#7aa2f7" opacity="0.5"/>
+  <rect x="145" y="155" width="25" height="6" rx="3" fill="#9ece6a" opacity="0.5"/>
+</svg>
