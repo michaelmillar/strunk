@@ -81,6 +81,119 @@ impl<'a> TaskSubmit<'a> {
     }
 }
 
+pub struct BatchItem {
+    pub queue: String,
+    pub payload: serde_json::Value,
+    pub metadata: serde_json::Value,
+    pub priority: i32,
+    pub max_retries: i32,
+    pub delay_secs: f64,
+}
+
+impl BatchItem {
+    pub fn new(queue: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            queue: queue.into(),
+            payload,
+            metadata: serde_json::json!({}),
+            priority: 0,
+            max_retries: 3,
+            delay_secs: 0.0,
+        }
+    }
+
+    pub fn priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn max_retries(mut self, max_retries: i32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay_secs = delay.as_secs_f64();
+        self
+    }
+}
+
+pub async fn submit_batch(
+    tx: &mut Transaction<'static, Postgres>,
+    items: Vec<BatchItem>,
+) -> Result<Vec<i64>> {
+    if items.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut keys = Vec::with_capacity(items.len());
+    let mut payloads = Vec::with_capacity(items.len());
+    let mut metadatas = Vec::with_capacity(items.len());
+    let mut priorities = Vec::with_capacity(items.len());
+    let mut retries = Vec::with_capacity(items.len());
+    let mut delays = Vec::with_capacity(items.len());
+
+    for item in &items {
+        keys.push(item.queue.as_str());
+        payloads.push(&item.payload);
+        metadatas.push(&item.metadata);
+        priorities.push(item.priority);
+        retries.push(item.max_retries);
+        delays.push(item.delay_secs);
+    }
+
+    let ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO strunk_outbox (kind, key, payload, metadata, priority, max_retries, visible_at)
+        SELECT 'task', key, payload, metadata, priority, max_retries,
+               now() + make_interval(secs => delay::double precision)
+        FROM unnest($1::text[], $2::jsonb[], $3::jsonb[], $4::int[], $5::int[], $6::float8[])
+            AS t(key, payload, metadata, priority, max_retries, delay)
+        RETURNING id
+        "#,
+    )
+    .bind(&keys)
+    .bind(&payloads)
+    .bind(&metadatas)
+    .bind(&priorities)
+    .bind(&retries)
+    .bind(&delays)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    Ok(ids)
+}
+
+pub trait Middleware: Send + Sync + 'static {
+    fn before(&self, task: &Task) {
+        let _ = task;
+    }
+
+    fn after_success(&self, task_id: i64, duration: Duration) {
+        let _ = (task_id, duration);
+    }
+
+    fn after_failure(&self, task_id: i64, duration: Duration, error: &str) {
+        let _ = (task_id, duration, error);
+    }
+}
+
+pub struct LoggingMiddleware;
+
+impl Middleware for LoggingMiddleware {
+    fn before(&self, task: &Task) {
+        tracing::info!(task_id = task.id, queue = %task.queue, "starting task");
+    }
+
+    fn after_success(&self, task_id: i64, duration: Duration) {
+        tracing::info!(task_id, duration_ms = duration.as_millis() as u64, "task completed");
+    }
+
+    fn after_failure(&self, task_id: i64, duration: Duration, error: &str) {
+        tracing::warn!(task_id, duration_ms = duration.as_millis() as u64, error, "task failed");
+    }
+}
+
 pub async fn claim(pool: &PgPool, queue: &str, visibility_timeout: Duration) -> Result<Option<Task>> {
     let timeout_secs = visibility_timeout.as_secs_f64();
 
@@ -126,6 +239,7 @@ pub struct Worker {
     visibility_timeout: Duration,
     poll_interval: Duration,
     token: CancellationToken,
+    middleware: Option<std::sync::Arc<dyn Middleware>>,
 }
 
 impl Worker {
@@ -137,6 +251,7 @@ impl Worker {
             visibility_timeout: Duration::from_secs(30),
             poll_interval: Duration::from_millis(100),
             token: CancellationToken::new(),
+            middleware: None,
         }
     }
 
@@ -160,6 +275,11 @@ impl Worker {
         self
     }
 
+    pub fn middleware(mut self, mw: impl Middleware) -> Self {
+        self.middleware = Some(std::sync::Arc::new(mw));
+        self
+    }
+
     pub fn spawn<F, Fut>(self, handler: F) -> Vec<JoinHandle<()>>
     where
         F: Fn(Task) -> Fut + Send + Sync + Clone + 'static,
@@ -174,6 +294,7 @@ impl Worker {
             let visibility_timeout = self.visibility_timeout;
             let poll_interval = self.poll_interval;
             let token = self.token.clone();
+            let middleware = self.middleware.clone();
 
             let handle = tokio::spawn(async move {
                 loop {
@@ -188,15 +309,25 @@ impl Worker {
                             let max_retries = task.attempts;
                             let attempts = task.attempts;
 
-                            debug!(worker_id, task_id, queue = %queue, "claimed task");
+                            if let Some(ref mw) = middleware {
+                                mw.before(&task);
+                            }
+
+                            let start = tokio::time::Instant::now();
 
                             match handler(task).await {
                                 Ok(()) => {
+                                    if let Some(ref mw) = middleware {
+                                        mw.after_success(task_id, start.elapsed());
+                                    }
                                     if let Err(e) = complete(&pool, task_id).await {
                                         error!(task_id, error = %e, "failed to mark task complete");
                                     }
                                 }
                                 Err(e) => {
+                                    if let Some(ref mw) = middleware {
+                                        mw.after_failure(task_id, start.elapsed(), &e.to_string());
+                                    }
                                     warn!(task_id, error = %e, "task handler failed");
                                     if let Err(e) = fail(&pool, task_id, max_retries, attempts).await {
                                         error!(task_id, error = %e, "failed to mark task failed");

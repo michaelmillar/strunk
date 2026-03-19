@@ -14,6 +14,19 @@ tracing = "0.1"
 rand = "0.8"
 thiserror = "2"
 tokio-util = "0.7"
+clap = { version = "4", features = ["derive", "env"], optional = true }
+tabled = { version = "0.17", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+anyhow = { version = "1", optional = true }
+
+[features]
+default = []
+cli = ["clap", "tabled", "tracing-subscriber", "anyhow"]
+
+[[bin]]
+name = "strunk"
+path = "src/bin/cli.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 anyhow = "1"

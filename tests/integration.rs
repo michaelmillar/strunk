@@ -464,3 +464,43 @@ async fn transaction_atomicity() {
         .unwrap();
     assert!(task.is_none(), "dropped transaction should not leave visible tasks");
 }
+
+#[tokio::test]
+async fn batch_submit() {
+    let Some(strunk) = setup().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+
+    let items = (0..10)
+        .map(|i| {
+            strunk::BatchItem::new("batch-queue", serde_json::json!({"index": i}))
+                .priority(i as i32)
+        })
+        .collect();
+
+    let mut tx = strunk.begin().await.unwrap();
+    let ids = strunk.submit_batch(&mut tx, items).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(ids.len(), 10);
+
+    let first = strunk
+        .claim("batch-queue", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.payload["index"], 9, "highest priority should come first");
+}
+
+#[tokio::test]
+async fn health_check() {
+    let Some(strunk) = setup().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+
+    let report = strunk.health(Duration::from_secs(300)).await.unwrap();
+    assert!(report.healthy);
+    assert_eq!(report.pending, 0);
+}

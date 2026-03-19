@@ -157,6 +157,88 @@ strunk.shutdown();
 for h in handles { h.await.ok(); }
 ```
 
+## Batch submit
+
+Submit many tasks in a single query instead of one at a time.
+
+```rust
+let items = orders.iter().map(|o| {
+    BatchItem::new("fulfilment", json!({"order_id": o.id}))
+        .priority(o.priority)
+}).collect();
+
+let mut tx = strunk.begin().await?;
+let ids = strunk.submit_batch(&mut tx, items).await?;
+tx.commit().await?;
+```
+
+## Worker middleware
+
+Add logging, metrics, or tracing without touching handler logic.
+
+```rust
+use strunk::LoggingMiddleware;
+
+strunk.worker("email-queue")
+    .middleware(LoggingMiddleware)
+    .concurrency(4)
+    .spawn(|task| async move {
+        send_email(&task.payload).await?;
+        Ok(())
+    });
+```
+
+Or implement your own:
+
+```rust
+struct MetricsMiddleware;
+
+impl strunk::Middleware for MetricsMiddleware {
+    fn before(&self, task: &strunk::Task) {
+        counter!("tasks.started", 1, "queue" => task.queue.clone());
+    }
+    fn after_success(&self, _id: i64, duration: Duration) {
+        histogram!("tasks.duration_ms", duration.as_millis() as f64);
+    }
+    fn after_failure(&self, _id: i64, _duration: Duration, error: &str) {
+        counter!("tasks.failed", 1);
+    }
+}
+```
+
+## Health check
+
+Detect stale pending rows and unreachable databases.
+
+```rust
+let report = strunk.health(Duration::from_secs(300)).await?;
+// report.healthy, report.pending, report.oldest_pending_age_secs
+```
+
+## CLI
+
+Install with:
+
+```bash
+cargo install strunk --features cli
+```
+
+Then:
+
+```bash
+strunk --database-url postgres://localhost/mydb migrate
+strunk --database-url postgres://localhost/mydb stats
+strunk --database-url postgres://localhost/mydb stats --queue email-queue
+strunk --database-url postgres://localhost/mydb dead-letters email-queue
+strunk --database-url postgres://localhost/mydb retry 12345
+strunk --database-url postgres://localhost/mydb retry-all email-queue
+strunk --database-url postgres://localhost/mydb subscribers
+strunk --database-url postgres://localhost/mydb lag search-indexer
+strunk --database-url postgres://localhost/mydb health
+```
+
+Or set `DATABASE_URL` in your environment and omit the flag.
+
 ## What Strunk is not
 
 - Not a stream processing engine. No windowed aggregations or stream joins.

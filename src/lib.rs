@@ -1,6 +1,7 @@
 pub mod change_feed;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod migrate;
 pub mod reaper;
 pub mod relay;
@@ -11,7 +12,9 @@ pub mod types;
 
 pub use config::StrunkConfig;
 pub use error::{Result, StrunkError};
+pub use health::HealthReport;
 pub use stats::{OverallStats, QueueStats, SubscriberStats};
+pub use task_queue::{BatchItem, LoggingMiddleware, Middleware};
 pub use types::{Change, MessageKind, MessageStatus, OutboxRow, Task};
 
 use std::time::Duration;
@@ -87,6 +90,14 @@ impl Strunk {
         queue: impl Into<String>,
     ) -> TaskSubmit<'a> {
         TaskSubmit::new(tx, queue)
+    }
+
+    pub async fn submit_batch(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        items: Vec<BatchItem>,
+    ) -> Result<Vec<i64>> {
+        task_queue::submit_batch(tx, items).await
     }
 
     pub fn change<'a>(
@@ -206,5 +217,9 @@ impl Strunk {
 
     pub async fn overall_stats(&self) -> Result<stats::OverallStats> {
         stats::overall_stats(&self.pool).await
+    }
+
+    pub async fn health(&self, max_pending_age: Duration) -> Result<HealthReport> {
+        health::check(&self.pool, max_pending_age).await
     }
 }
