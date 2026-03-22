@@ -24,6 +24,7 @@ pub struct OutboxRow {
     pub id: i64,
     pub kind: MessageKind,
     pub key: String,
+    pub dedup_key: Option<String>,
     pub payload: serde_json::Value,
     pub metadata: serde_json::Value,
     pub status: MessageStatus,

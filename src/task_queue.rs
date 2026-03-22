@@ -18,6 +18,7 @@ pub struct TaskSubmit<'a> {
     priority: i32,
     max_retries: i32,
     delay: Option<Duration>,
+    dedup_key: Option<String>,
 }
 
 impl<'a> TaskSubmit<'a> {
@@ -30,6 +31,7 @@ impl<'a> TaskSubmit<'a> {
             priority: 0,
             max_retries: 3,
             delay: None,
+            dedup_key: None,
         }
     }
 
@@ -58,17 +60,23 @@ impl<'a> TaskSubmit<'a> {
         self
     }
 
+    pub fn dedup_key(mut self, key: impl Into<String>) -> Self {
+        self.dedup_key = Some(key.into());
+        self
+    }
+
     pub async fn submit(self) -> Result<i64> {
         let delay_secs = self.delay.map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
         let row = sqlx::query_scalar::<_, i64>(
             r#"
-            INSERT INTO strunk_outbox (kind, key, payload, metadata, priority, max_retries, visible_at)
-            VALUES ('task', $1, $2, $3, $4, $5, now() + make_interval(secs => $6::double precision))
+            INSERT INTO strunk_outbox (kind, key, dedup_key, payload, metadata, priority, max_retries, visible_at)
+            VALUES ('task', $1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))
             RETURNING id
             "#,
         )
         .bind(&self.queue)
+        .bind(&self.dedup_key)
         .bind(&self.payload)
         .bind(&self.metadata)
         .bind(self.priority)

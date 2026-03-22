@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS strunk_outbox (
     id           BIGSERIAL PRIMARY KEY,
     kind         TEXT NOT NULL,
     key          TEXT NOT NULL,
+    dedup_key    TEXT,
     payload      JSONB NOT NULL,
     metadata     JSONB NOT NULL DEFAULT '{}',
     status       TEXT NOT NULL DEFAULT 'pending',
@@ -17,6 +18,10 @@ CREATE TABLE IF NOT EXISTS strunk_outbox (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at TIMESTAMPTZ
 )
+"#;
+
+const ADD_DEDUP_COLUMN: &str = r#"
+ALTER TABLE strunk_outbox ADD COLUMN IF NOT EXISTS dedup_key TEXT
 "#;
 
 const CREATE_INDEX_POLL: &str = r#"
@@ -41,6 +46,12 @@ const CREATE_INDEX_DEAD: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_strunk_outbox_dead
     ON strunk_outbox (key, created_at DESC)
     WHERE status = 'dead'
+"#;
+
+const CREATE_INDEX_DEDUP: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strunk_outbox_dedup
+    ON strunk_outbox (dedup_key)
+    WHERE dedup_key IS NOT NULL AND status IN ('pending', 'claimed')
 "#;
 
 const CREATE_SUBSCRIBERS: &str = r#"
@@ -76,10 +87,12 @@ CREATE TABLE IF NOT EXISTS strunk_schemas (
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     sqlx::query(CREATE_OUTBOX).execute(pool).await?;
+    sqlx::query(ADD_DEDUP_COLUMN).execute(pool).await?;
     sqlx::query(CREATE_INDEX_POLL).execute(pool).await?;
     sqlx::query(CREATE_INDEX_CLAIM).execute(pool).await?;
     sqlx::query(CREATE_INDEX_REAPER).execute(pool).await?;
     sqlx::query(CREATE_INDEX_DEAD).execute(pool).await?;
+    sqlx::query(CREATE_INDEX_DEDUP).execute(pool).await?;
     sqlx::query(CREATE_SUBSCRIBERS).execute(pool).await?;
     sqlx::query(CREATE_SNAPSHOTS).execute(pool).await?;
     sqlx::query(CREATE_SCHEMAS).execute(pool).await?;
