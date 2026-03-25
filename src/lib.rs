@@ -5,6 +5,7 @@ pub mod health;
 pub mod migrate;
 pub mod reaper;
 pub mod relay;
+pub mod scheduler;
 pub mod schema;
 pub mod stats;
 pub mod task_queue;
@@ -13,9 +14,10 @@ pub mod types;
 pub use config::StrunkConfig;
 pub use error::{Result, StrunkError};
 pub use health::HealthReport;
+pub use scheduler::{Schedule, ScheduleBuilder};
 pub use stats::{OverallStats, QueueStats, SubscriberStats};
 pub use task_queue::{BatchItem, LoggingMiddleware, Middleware};
-pub use types::{Change, MessageKind, MessageStatus, OutboxRow, Task};
+pub use types::{Change, MessageKind, MessageStatus, OutboxRow, Task, TaskResult};
 
 use std::time::Duration;
 
@@ -138,8 +140,33 @@ impl Strunk {
         task_queue::complete(&self.pool, task_id).await
     }
 
+    pub async fn complete_with_result(
+        &self,
+        task_id: i64,
+        queue: &str,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        task_queue::complete_with_result(&self.pool, task_id, queue, result).await
+    }
+
+    pub async fn get_result(&self, task_id: i64) -> Result<Option<TaskResult>> {
+        task_queue::get_result(&self.pool, task_id).await
+    }
+
     pub async fn fail(&self, task_id: i64, max_retries: i32, attempts: i32) -> Result<()> {
         task_queue::fail(&self.pool, task_id, max_retries, attempts).await
+    }
+
+    pub async fn heartbeat(&self, task_id: i64, extend_by: Duration) -> Result<()> {
+        task_queue::heartbeat(&self.pool, task_id, extend_by).await
+    }
+
+    pub async fn set_progress(&self, task_id: i64, progress: i16) -> Result<()> {
+        task_queue::set_progress(&self.pool, task_id, progress).await
+    }
+
+    pub async fn get_progress(&self, task_id: i64) -> Result<Option<i16>> {
+        task_queue::get_progress(&self.pool, task_id).await
     }
 
     pub fn worker(&self, queue: impl Into<String>) -> Worker {
@@ -163,6 +190,36 @@ impl Strunk {
             self.config.relay_batch_size,
         )
         .cancellation_token(self.token.clone())
+    }
+
+    pub fn schedule(
+        &self,
+        id: impl Into<String>,
+        queue: impl Into<String>,
+        cron: impl Into<String>,
+    ) -> ScheduleBuilder {
+        ScheduleBuilder::new(self.pool.clone(), id, queue, cron)
+    }
+
+    pub fn scheduler(&self) -> scheduler::Scheduler {
+        scheduler::Scheduler::new(self.pool.clone())
+            .cancellation_token(self.token.clone())
+    }
+
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
+        scheduler::list(&self.pool).await
+    }
+
+    pub async fn disable_schedule(&self, id: &str) -> Result<()> {
+        scheduler::disable(&self.pool, id).await
+    }
+
+    pub async fn enable_schedule(&self, id: &str) -> Result<()> {
+        scheduler::enable(&self.pool, id).await
+    }
+
+    pub async fn remove_schedule(&self, id: &str) -> Result<()> {
+        scheduler::remove(&self.pool, id).await
     }
 
     pub async fn begin(&self) -> Result<Transaction<'static, Postgres>> {

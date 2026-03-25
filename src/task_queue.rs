@@ -236,8 +236,78 @@ pub async fn complete(pool: &PgPool, task_id: i64) -> Result<()> {
     relay::mark_delivered(pool, task_id).await
 }
 
+pub async fn complete_with_result(
+    pool: &PgPool,
+    task_id: i64,
+    queue: &str,
+    result: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO strunk_results (task_id, queue, result)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (task_id) DO UPDATE SET result = $3, completed_at = now()
+        "#,
+    )
+    .bind(task_id)
+    .bind(queue)
+    .bind(&result)
+    .execute(pool)
+    .await?;
+
+    relay::mark_delivered(pool, task_id).await
+}
+
+pub async fn get_result(pool: &PgPool, task_id: i64) -> Result<Option<crate::types::TaskResult>> {
+    let row = sqlx::query_as::<_, (i64, String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+        "SELECT task_id, queue, result, completed_at FROM strunk_results WHERE task_id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(task_id, queue, result, completed_at)| crate::types::TaskResult {
+        task_id,
+        queue,
+        result,
+        completed_at,
+    }))
+}
+
 pub async fn fail(pool: &PgPool, task_id: i64, max_retries: i32, attempts: i32) -> Result<()> {
     relay::mark_failed(pool, task_id, max_retries, attempts).await
+}
+
+pub async fn heartbeat(pool: &PgPool, task_id: i64, extend_by: Duration) -> Result<()> {
+    sqlx::query(
+        "UPDATE strunk_outbox SET visible_at = now() + make_interval(secs => $2::double precision) WHERE id = $1 AND status = 'claimed'",
+    )
+    .bind(task_id)
+    .bind(extend_by.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_progress(pool: &PgPool, task_id: i64, progress: i16) -> Result<()> {
+    sqlx::query(
+        "UPDATE strunk_outbox SET progress = $2 WHERE id = $1 AND status = 'claimed'",
+    )
+    .bind(task_id)
+    .bind(progress.clamp(0, 100))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_progress(pool: &PgPool, task_id: i64) -> Result<Option<i16>> {
+    let row = sqlx::query_scalar::<_, i16>(
+        "SELECT progress FROM strunk_outbox WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 pub struct Worker {

@@ -85,9 +85,44 @@ CREATE TABLE IF NOT EXISTS strunk_schemas (
 )
 "#;
 
+const ADD_PROGRESS_COLUMN: &str = r#"
+ALTER TABLE strunk_outbox ADD COLUMN IF NOT EXISTS progress SMALLINT NOT NULL DEFAULT 0
+"#;
+
+const CREATE_RESULTS: &str = r#"
+CREATE TABLE IF NOT EXISTS strunk_results (
+    task_id     BIGINT PRIMARY KEY,
+    queue       TEXT NOT NULL,
+    result      JSONB NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"#;
+
+const CREATE_SCHEDULES: &str = r#"
+CREATE TABLE IF NOT EXISTS strunk_schedules (
+    id           TEXT PRIMARY KEY,
+    queue        TEXT NOT NULL,
+    payload      JSONB NOT NULL DEFAULT '{}',
+    cron         TEXT NOT NULL,
+    max_retries  INT NOT NULL DEFAULT 3,
+    priority     INT NOT NULL DEFAULT 0,
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    last_fired   TIMESTAMPTZ,
+    next_fire    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"#;
+
+const CREATE_INDEX_SCHEDULES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_strunk_schedules_next
+    ON strunk_schedules (next_fire)
+    WHERE enabled = true
+"#;
+
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     sqlx::query(CREATE_OUTBOX).execute(pool).await?;
     sqlx::query(ADD_DEDUP_COLUMN).execute(pool).await?;
+    sqlx::query(ADD_PROGRESS_COLUMN).execute(pool).await?;
     sqlx::query(CREATE_INDEX_POLL).execute(pool).await?;
     sqlx::query(CREATE_INDEX_CLAIM).execute(pool).await?;
     sqlx::query(CREATE_INDEX_REAPER).execute(pool).await?;
@@ -96,5 +131,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     sqlx::query(CREATE_SUBSCRIBERS).execute(pool).await?;
     sqlx::query(CREATE_SNAPSHOTS).execute(pool).await?;
     sqlx::query(CREATE_SCHEMAS).execute(pool).await?;
+    sqlx::query(CREATE_RESULTS).execute(pool).await?;
+    sqlx::query(CREATE_SCHEDULES).execute(pool).await?;
+    sqlx::query(CREATE_INDEX_SCHEDULES).execute(pool).await?;
     Ok(())
 }

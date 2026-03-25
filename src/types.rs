@@ -31,6 +31,7 @@ pub struct OutboxRow {
     pub attempts: i32,
     pub max_retries: i32,
     pub priority: i32,
+    pub progress: i16,
     pub visible_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
@@ -43,6 +44,7 @@ pub struct Task {
     pub payload: serde_json::Value,
     pub metadata: serde_json::Value,
     pub attempts: i32,
+    pub max_retries: i32,
     pub created_at: DateTime<Utc>,
 }
 
@@ -54,9 +56,18 @@ impl From<OutboxRow> for Task {
             payload: row.payload,
             metadata: row.metadata,
             attempts: row.attempts,
+            max_retries: row.max_retries,
             created_at: row.created_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub task_id: i64,
+    pub queue: String,
+    pub result: serde_json::Value,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
