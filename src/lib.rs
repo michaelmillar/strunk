@@ -1,4 +1,4 @@
-pub mod change_feed;
+pub mod events;
 pub mod config;
 pub mod error;
 pub mod health;
@@ -17,7 +17,7 @@ pub use health::HealthReport;
 pub use scheduler::{Schedule, ScheduleBuilder};
 pub use stats::{OverallStats, QueueStats, SubscriberStats};
 pub use task_queue::{BatchItem, LoggingMiddleware, Middleware};
-pub use types::{Change, MessageKind, MessageStatus, OutboxRow, Task, TaskResult};
+pub use types::{MessageKind, MessageStatus, OutboxRow, StateEvent, Task, TaskResult, TypedStateEvent, TypedTask};
 
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio_util::sync::CancellationToken;
 
-use crate::change_feed::{ChangePublish, Subscriber};
+use crate::events::{EventPublish, Subscriber};
 use crate::reaper::Reaper;
 use crate::schema::SchemaRegistry;
 use crate::task_queue::{TaskSubmit, Worker};
@@ -102,13 +102,13 @@ impl Strunk {
         task_queue::submit_batch(tx, items).await
     }
 
-    pub fn change<'a>(
+    pub fn event<'a>(
         &'a self,
         tx: &'a mut Transaction<'static, Postgres>,
         entity_type: impl Into<String>,
         entity_id: impl Into<String>,
-    ) -> ChangePublish<'a> {
-        ChangePublish::new(tx, entity_type, entity_id).with_registry(&self.registry)
+    ) -> EventPublish<'a> {
+        EventPublish::new(tx, entity_type, entity_id).with_registry(&self.registry)
     }
 
     pub async fn snapshot(
@@ -116,7 +116,7 @@ impl Strunk {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<Option<serde_json::Value>> {
-        change_feed::snapshot(&self.pool, entity_type, entity_id).await
+        events::snapshot(&self.pool, entity_type, entity_id).await
     }
 
     pub fn subscriber(
@@ -125,6 +125,7 @@ impl Strunk {
         entity_type: impl Into<String>,
     ) -> Subscriber {
         Subscriber::new(self.pool.clone(), id, entity_type)
+            .database_url(self.config.database_url.clone())
             .cancellation_token(self.token.clone())
     }
 
@@ -171,6 +172,7 @@ impl Strunk {
 
     pub fn worker(&self, queue: impl Into<String>) -> Worker {
         Worker::new(self.pool.clone(), queue)
+            .database_url(self.config.database_url.clone())
             .cancellation_token(self.token.clone())
     }
 
@@ -278,5 +280,26 @@ impl Strunk {
 
     pub async fn health(&self, max_pending_age: Duration) -> Result<HealthReport> {
         health::check(&self.pool, max_pending_age).await
+    }
+
+    pub async fn replay_subscriber(&self, subscriber_id: &str, from_id: i64) -> Result<()> {
+        sqlx::query("UPDATE strunk_subscribers SET last_seen_id = $2 WHERE id = $1")
+            .bind(subscriber_id)
+            .bind(from_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_subscriber(&self, subscriber_id: &str) -> Result<()> {
+        self.replay_subscriber(subscriber_id, 0).await
+    }
+
+    pub async fn inbox_contains(&self, consumer_id: &str, message_id: i64) -> Result<bool> {
+        task_queue::inbox_contains(&self.pool, consumer_id, message_id).await
+    }
+
+    pub async fn inbox_mark(&self, consumer_id: &str, message_id: i64) -> Result<()> {
+        task_queue::inbox_mark(&self.pool, consumer_id, message_id).await
     }
 }

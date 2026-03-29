@@ -196,7 +196,7 @@ async fn chaos_subscriber_crash_and_resume() {
 
     for i in 0..20 {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "event", &i.to_string())
+        strunk.event(&mut tx, "event", &i.to_string())
             .state(serde_json::json!({"seq": i}))
             .schema_version("1.0")
             .publish().await.unwrap();
@@ -209,10 +209,10 @@ async fn chaos_subscriber_crash_and_resume() {
 
     let sub = strunk.subscriber("crash-sub", "event")
         .poll_interval(Duration::from_millis(50))
-        .spawn(move |change| {
+        .spawn(move |event| {
             let seen = seen_clone.clone();
             async move {
-                let seq = change.state["seq"].as_i64().unwrap();
+                let seq = event.state["seq"].as_i64().unwrap();
                 if seq == crash_at {
                     return Err("simulated crash".into());
                 }
@@ -232,10 +232,10 @@ async fn chaos_subscriber_crash_and_resume() {
 
     let sub2 = strunk.subscriber("crash-sub", "event")
         .poll_interval(Duration::from_millis(50))
-        .spawn(move |change| {
+        .spawn(move |event| {
             let seen = seen_clone.clone();
             async move {
-                seen.lock().await.push(change.state["seq"].as_i64().unwrap());
+                seen.lock().await.push(event.state["seq"].as_i64().unwrap());
                 Ok(())
             }
         });

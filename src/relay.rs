@@ -38,7 +38,7 @@ impl Relay {
             WHERE id IN (
                 SELECT id FROM strunk_outbox
                 WHERE status = 'pending'
-                AND kind = 'change'
+                AND kind = 'event'
                 AND visible_at <= now()
                 ORDER BY priority DESC, id
                 LIMIT $1
@@ -70,7 +70,7 @@ impl Relay {
                     Ok(rows) => {
                         let count = rows.len();
                         if count > 0 {
-                            debug!(count, "relay delivered change messages");
+                            debug!(count, "relay delivered event messages");
                         }
                         for row in rows {
                             handler(row).await;

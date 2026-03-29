@@ -174,7 +174,7 @@ async fn task_priority_ordering() {
 }
 
 #[tokio::test]
-async fn change_feed_publish_and_snapshot() {
+async fn event_publish_and_snapshot() {
     let Some(mut strunk) = setup().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -196,8 +196,8 @@ async fn change_feed_publish_and_snapshot() {
         .unwrap();
 
     let mut tx = strunk.begin().await.unwrap();
-    let change_id = strunk
-        .change(&mut tx, "order", "42")
+    let event_id = strunk
+        .event(&mut tx, "order", "42")
         .state(serde_json::json!({
             "id": 42,
             "status": "confirmed",
@@ -209,7 +209,7 @@ async fn change_feed_publish_and_snapshot() {
         .unwrap();
     tx.commit().await.unwrap();
 
-    assert!(change_id > 0);
+    assert!(event_id > 0);
 
     let state = strunk.snapshot("order", "42").await.unwrap();
     assert!(state.is_some());
@@ -219,7 +219,7 @@ async fn change_feed_publish_and_snapshot() {
 }
 
 #[tokio::test]
-async fn change_feed_snapshot_updates() {
+async fn event_snapshot_updates() {
     let Some(mut strunk) = setup().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -242,7 +242,7 @@ async fn change_feed_snapshot_updates() {
 
     let mut tx = strunk.begin().await.unwrap();
     strunk
-        .change(&mut tx, "order", "99")
+        .event(&mut tx, "order", "99")
         .state(serde_json::json!({
             "id": 99,
             "status": "pending",
@@ -256,7 +256,7 @@ async fn change_feed_snapshot_updates() {
 
     let mut tx = strunk.begin().await.unwrap();
     strunk
-        .change(&mut tx, "order", "99")
+        .event(&mut tx, "order", "99")
         .state(serde_json::json!({
             "id": 99,
             "status": "shipped",
@@ -295,7 +295,7 @@ async fn schema_validation_rejects_bad_payload() {
 
     let mut tx = strunk.begin().await.unwrap();
     let result = strunk
-        .change(&mut tx, "user", "1")
+        .event(&mut tx, "user", "1")
         .state(serde_json::json!({"id": 1}))
         .schema_version("1.0")
         .publish()

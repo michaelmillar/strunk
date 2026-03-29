@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
     pub queue: String,
     pub pending: i64,
@@ -13,7 +14,7 @@ pub struct QueueStats {
     pub oldest_pending: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubscriberStats {
     pub id: String,
     pub entity_type: String,
@@ -22,7 +23,7 @@ pub struct SubscriberStats {
     pub lag: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OverallStats {
     pub total_pending: i64,
     pub total_claimed: i64,
@@ -74,7 +75,7 @@ pub async fn subscriber_stats(pool: &PgPool, subscriber_id: &str) -> Result<Opti
     let latest_id = sqlx::query_scalar::<_, Option<i64>>(
         r#"
         SELECT max(id) FROM strunk_outbox
-        WHERE kind = 'change' AND key LIKE $1 || '%'
+        WHERE kind = 'event' AND key LIKE $1 || '%'
         "#,
     )
     .bind(&key_prefix)
@@ -92,21 +93,16 @@ pub async fn subscriber_stats(pool: &PgPool, subscriber_id: &str) -> Result<Opti
 }
 
 pub async fn overall_stats(pool: &PgPool) -> Result<OverallStats> {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
         r#"
         SELECT
-            count(*) FILTER (WHERE status = 'pending') as pending,
-            count(*) FILTER (WHERE status = 'claimed') as claimed,
-            count(*) FILTER (WHERE status = 'delivered') as delivered,
-            count(*) FILTER (WHERE status = 'dead') as dead
+            count(*) FILTER (WHERE status = 'pending'),
+            count(*) FILTER (WHERE status = 'claimed'),
+            count(*) FILTER (WHERE status = 'delivered'),
+            count(*) FILTER (WHERE status = 'dead'),
+            count(*)
         FROM strunk_outbox
         "#,
-    )
-    .fetch_one(pool)
-    .await?;
-
-    let table_size = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM strunk_outbox",
     )
     .fetch_one(pool)
     .await?;
@@ -116,6 +112,6 @@ pub async fn overall_stats(pool: &PgPool) -> Result<OverallStats> {
         total_claimed: row.1,
         total_delivered: row.2,
         total_dead: row.3,
-        table_size,
+        table_size: row.4,
     })
 }

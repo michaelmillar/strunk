@@ -186,7 +186,7 @@ async fn stress_rapid_publish_subscribe() {
     let publish_count = 500;
     for i in 0..publish_count {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "tick", &(i % 10).to_string())
+        strunk.event(&mut tx, "tick", &(i % 10).to_string())
             .state(serde_json::json!({"seq": i}))
             .schema_version("1.0")
             .publish().await.unwrap();
@@ -199,7 +199,7 @@ async fn stress_rapid_publish_subscribe() {
     let sub = strunk.subscriber("rapid-sub", "tick")
         .poll_interval(Duration::from_millis(10))
         .batch_size(100)
-        .spawn(move |_change| {
+        .spawn(move |_event| {
             let received = received_clone.clone();
             async move {
                 received.fetch_add(1, Ordering::Relaxed);

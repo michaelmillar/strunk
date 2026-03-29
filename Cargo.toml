@@ -2,7 +2,7 @@
 name = "strunk"
 version = "0.1.0"
 edition = "2024"
-description = "Omit needless infrastructure. Transactional task queues and change feeds backed by your database."
+description = "Durable task queues and state events for Rust services on PostgreSQL. No broker required."
 
 [dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono"] }
@@ -18,10 +18,13 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tabled = { version = "0.17", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["fs"], optional = true }
 
 [features]
 default = []
 cli = ["clap", "tabled", "tracing-subscriber", "anyhow"]
+web = ["cli", "axum", "tower-http"]
 
 [[bin]]
 name = "strunk"

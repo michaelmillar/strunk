@@ -1,10 +1,11 @@
 use std::time::Duration;
 
+use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HealthReport {
     pub healthy: bool,
     pub pending: i64,

@@ -5,95 +5,181 @@
 </p>
 
 <p align="center">
-  Transactional task queues and change feeds backed by your database.
+  Durable background jobs and state events for PostgreSQL-backed Rust services.
   <br/>
-  No broker. No cluster. No new infrastructure.
+  Enqueue work and publish domain state in the same transaction as your business data.
 </p>
 
 ---
 
-<p align="center">
-  <img src="assets/screenshot.svg" alt="strunk example" width="750"/>
-</p>
+https://github.com/user-attachments/assets/508b0ac3-ff11-4e2f-ac78-feff9b0e408e
 
-## What is this
+## What it does
 
-Strunk is a Rust library that gives you durable task queues and entity change feeds using your existing PostgreSQL database. Everything runs inside your normal database transactions, so there is no dual-write problem, no separate broker to operate, and no new failure domain.
+Strunk is a Rust library that gives your service durable task queues and entity state events using your existing PostgreSQL database. Both primitives write to an outbox table inside your normal database transactions. If the transaction rolls back, the work never existed. If it commits, delivery follows.
 
-## The core idea
-
-When your service wants to dispatch a task or publish a state change, it writes a row to an outbox table *in the same transaction* as its business data. A background relay delivers messages to consumers. If the transaction rolls back, the message never existed. If it commits, delivery is guaranteed.
+This eliminates the dual-write problem without introducing a message broker, and keeps your operational surface to one system you already run.
 
 ```rust
 let mut tx = strunk.begin().await?;
 
-// Business logic
 sqlx::query("UPDATE orders SET status = 'shipped' WHERE id = $1")
     .bind(order_id)
     .execute(&mut *tx)
     .await?;
 
-// Queue a notification (same transaction)
 strunk.task(&mut tx, "notifications")
     .payload(json!({"order_id": order_id, "type": "shipped"}))
     .submit()
     .await?;
 
-// Publish state change (same transaction)
-strunk.change(&mut tx, "order", &order_id.to_string())
+strunk.event(&mut tx, "order", &order_id.to_string())
     .state(json!({"id": order_id, "status": "shipped", "total": 59.99}))
     .publish()
     .await?;
 
 tx.commit().await?;
-// All three happen atomically. Or none of them do.
 ```
 
-## Three primitives
+All three writes happen atomically. Or none of them do.
 
-**Task Queue** for work dispatch. Submit, claim, complete, fail. At-least-once delivery, priority ordering, visibility timeouts, exponential backoff, dead-letter inspection via SQL.
+## Delivery guarantees
+
+Tasks are delivered **at least once**. A worker claims a task, processes it, and marks it complete. If the worker crashes, the visibility timeout expires and another worker reclaims it. This means your handlers must be idempotent for external side effects (HTTP calls, emails, webhooks). Use `dedup_key` to prevent duplicate submissions at enqueue time.
+
+State events are delivered **at least once, in order per entity**. Subscribers track their own cursor. If a subscriber crashes, it resumes from its last acknowledged position. No events are skipped.
+
+Neither primitive provides exactly-once delivery for effects outside the database. If your entire side effect is a database write in the same Postgres instance, you can achieve effectively-once by running it in a transaction. For anything external, design for at-least-once.
+
+## What you are operating
+
+Strunk adds several background loops to your process. These are not a broker cluster, but they are moving parts you should understand.
+
+**Relay** polls for pending event rows and marks them delivered. If it stops, event delivery stalls but no data is lost.
+
+**Reaper** deletes delivered and dead-lettered rows past their retention window. If it stops, the outbox table grows. Monitor `table_size` in stats.
+
+**Scheduler** fires recurring tasks by inserting rows when schedules come due. Uses deduplication to prevent double-firing across multiple instances.
+
+**Workers** claim and process tasks. If all workers stop, tasks accumulate as pending rows. Visibility timeouts ensure claimed-but-abandoned tasks resurface.
+
+Workers and subscribers use PostgreSQL `LISTEN/NOTIFY` for instant wakeup when new work arrives. The poll interval acts as a fallback, not the primary delivery mechanism. This means near-zero latency in the common case without hammering the database with empty polls.
+
+Your PostgreSQL instance bears the load of row locking, notification dispatch, and index maintenance. This is fine for moderate workloads (thousands of tasks per second on typical hardware). If your database is already your bottleneck, or you need sustained high-throughput fan-out, Strunk is not the right tool.
+
+## Task queue
+
+Submit, claim, complete, fail. At-least-once delivery, priority ordering, visibility timeouts, exponential backoff with jitter, dead-letter inspection.
 
 ```rust
-// Submit
 strunk.task(&mut tx, "email-queue")
     .payload(json!({"to": "user@example.com"}))
     .priority(5)
     .max_retries(3)
+    .dedup_key("welcome-user-42")
     .submit()
     .await?;
 
-// Process
 strunk.worker("email-queue")
     .concurrency(4)
     .spawn(|task| async move {
         send_email(&task.payload).await?;
-        Ok(()) // completes the task
-        // Err(..) triggers retry with backoff
+        Ok(())
     });
 ```
 
-**Change Feed** for state propagation. Publish the current state of an entity. Subscribers track their own cursor and resume from where they left off.
+### Typed handlers
+
+Define your payload as a Rust struct. Serialisation at enqueue, deserialisation at claim, both checked at compile time.
 
 ```rust
-// Publish (with schema validation)
-strunk.change(&mut tx, "order", "42")
+#[derive(Serialize, Deserialize)]
+struct SendEmail {
+    to: String,
+    template: String,
+}
+
+strunk.task(&mut tx, "emails")
+    .typed(&SendEmail { to: "user@example.com".into(), template: "welcome".into() })
+    .submit()
+    .await?;
+
+strunk.worker("emails")
+    .spawn_typed(|task: TypedTask<SendEmail>| async move {
+        send_email(&task.data.to, &task.data.template).await?;
+        Ok(())
+    });
+```
+
+If the payload cannot be deserialised into the expected type, the task fails immediately (poison message handling).
+
+### Consumer inbox
+
+Producer-side deduplication prevents duplicate submissions via `dedup_key`. The consumer inbox prevents duplicate processing. If a worker crashes after processing but before marking complete, the task will be reclaimed. With an inbox, the worker checks whether it already handled that task and skips the duplicate.
+
+```rust
+strunk.worker("payments")
+    .inbox("payment-processor")
+    .concurrency(4)
+    .spawn(|task| async move {
+        charge_card(&task.payload).await?;
+        Ok(())
+    });
+```
+
+The inbox is cleaned up automatically by the reaper alongside delivered rows.
+
+## State events
+
+Publish the current state of a domain entity inside your transaction. Subscribers track their own cursor and resume from where they left off. Snapshots give you the latest state without subscribing.
+
+This is not CDC. Strunk does not stream database mutations. You explicitly publish state when your application decides something meaningful happened.
+
+```rust
+strunk.event(&mut tx, "order", "42")
     .state(json!({"id": 42, "status": "confirmed", "total": 59.99}))
     .schema_version("1.0")
     .publish()
     .await?;
 
-// Subscribe
 strunk.subscriber("search-indexer", "order")
-    .spawn(|change| async move {
-        update_index(change.entity_id, &change.state).await?;
+    .spawn(|event| async move {
+        update_index(event.entity_id, &event.state).await?;
         Ok(())
     });
 
-// Snapshot (get current state without subscribing)
 let state = strunk.snapshot("order", "42").await?;
 ```
 
-**Schema Registry** for explicit coupling. Versioned contracts validated at publish time. Backward compatibility enforced automatically.
+Typed subscribers work the same way as typed workers:
+
+```rust
+strunk.subscriber("indexer", "order")
+    .spawn_typed(|event: TypedStateEvent<Order>| async move {
+        update_index(&event.entity_id, &event.data).await?;
+        Ok(())
+    });
+```
+
+### Replay
+
+Subscribers can be rewound to reprocess events from any point. Useful when a subscriber had a bug and you need to reprocess after deploying the fix.
+
+```rust
+strunk.replay_subscriber("search-indexer", from_id).await?;
+strunk.reset_subscriber("search-indexer").await?;
+```
+
+Or from the CLI:
+
+```bash
+strunk replay search-indexer --from 0
+strunk reset-subscriber search-indexer
+```
+
+## Schema registry
+
+Versioned contracts validated at publish time. Backward compatibility enforced automatically. Adding optional fields is fine. Removing required fields or changing types fails at registration.
 
 ```rust
 strunk.register_schema("order", "1.0", &json!({
@@ -105,7 +191,6 @@ strunk.register_schema("order", "1.0", &json!({
     "required": ["id", "status", "total"]
 }))?;
 
-// Adding optional fields is fine
 strunk.register_schema("order", "1.1", &json!({
     "properties": {
         "id": {"type": "integer"},
@@ -115,8 +200,6 @@ strunk.register_schema("order", "1.1", &json!({
     },
     "required": ["id", "status", "total"]
 }))?;
-
-// Removing required fields or changing types fails at registration
 ```
 
 ## Observability
@@ -125,41 +208,19 @@ Everything is a SQL query.
 
 ```rust
 let stats = strunk.queue_stats("email-queue").await?;
-// stats.pending, stats.claimed, stats.dead, stats.delivered, stats.oldest_pending
-
 let sub = strunk.subscriber_stats("search-indexer").await?;
-// sub.lag, sub.last_seen_id, sub.latest_outbox_id
-
 let overall = strunk.overall_stats().await?;
-// overall.total_pending, overall.table_size
+let report = strunk.health(Duration::from_secs(300)).await?;
 ```
 
 Dead letters are rows, not a separate topic:
 
 ```sql
 SELECT * FROM strunk_outbox WHERE status = 'dead' AND key = 'email-queue';
--- Fix and retry:
 UPDATE strunk_outbox SET status = 'pending', attempts = 0 WHERE id = 12345;
 ```
 
-## Graceful shutdown
-
-All background loops accept a cancellation token. Call `shutdown()` and workers drain cleanly.
-
-```rust
-// Shared token across all workers, subscribers, relay, reaper
-let handles = strunk.worker("queue").spawn(handler);
-let _sub = strunk.subscriber("indexer", "order").spawn(on_change);
-let _reaper = strunk.reaper().spawn();
-
-// On SIGTERM:
-strunk.shutdown();
-for h in handles { h.await.ok(); }
-```
-
 ## Batch submit
-
-Submit many tasks in a single query instead of one at a time.
 
 ```rust
 let items = orders.iter().map(|o| {
@@ -172,13 +233,23 @@ let ids = strunk.submit_batch(&mut tx, items).await?;
 tx.commit().await?;
 ```
 
-## Worker middleware
-
-Add logging, metrics, or tracing without touching handler logic.
+## Recurring schedules
 
 ```rust
-use strunk::LoggingMiddleware;
+strunk.schedule("daily-report", "reports", "every 1d")
+    .payload(json!({"type": "daily"}))
+    .priority(3)
+    .register()
+    .await?;
 
+strunk.scheduler().spawn();
+```
+
+Supports `every 30s`, `every 5m`, `every 1h`, `every 1d`, `@hourly`, `@daily`, `@weekly`.
+
+## Worker middleware
+
+```rust
 strunk.worker("email-queue")
     .middleware(LoggingMiddleware)
     .concurrency(4)
@@ -188,42 +259,24 @@ strunk.worker("email-queue")
     });
 ```
 
-Or implement your own:
+## Graceful shutdown
+
+All background loops share a cancellation token.
 
 ```rust
-struct MetricsMiddleware;
+let handles = strunk.worker("queue").spawn(handler);
+let _sub = strunk.subscriber("indexer", "order").spawn(on_event);
+let _reaper = strunk.reaper().spawn();
 
-impl strunk::Middleware for MetricsMiddleware {
-    fn before(&self, task: &strunk::Task) {
-        counter!("tasks.started", 1, "queue" => task.queue.clone());
-    }
-    fn after_success(&self, _id: i64, duration: Duration) {
-        histogram!("tasks.duration_ms", duration.as_millis() as f64);
-    }
-    fn after_failure(&self, _id: i64, _duration: Duration, error: &str) {
-        counter!("tasks.failed", 1);
-    }
-}
-```
-
-## Health check
-
-Detect stale pending rows and unreachable databases.
-
-```rust
-let report = strunk.health(Duration::from_secs(300)).await?;
-// report.healthy, report.pending, report.oldest_pending_age_secs
+strunk.shutdown();
+for h in handles { h.await.ok(); }
 ```
 
 ## CLI
 
-Install with:
-
 ```bash
 cargo install strunk --features cli
 ```
-
-Then:
 
 ```bash
 strunk --database-url postgres://localhost/mydb migrate
@@ -235,16 +288,23 @@ strunk --database-url postgres://localhost/mydb retry-all email-queue
 strunk --database-url postgres://localhost/mydb subscribers
 strunk --database-url postgres://localhost/mydb lag search-indexer
 strunk --database-url postgres://localhost/mydb health
+strunk --database-url postgres://localhost/mydb replay search-indexer --from 0
+strunk --database-url postgres://localhost/mydb reset-subscriber search-indexer
 ```
 
 Or set `DATABASE_URL` in your environment and omit the flag.
 
-## What Strunk is not
+## When to use something else
 
-- Not a stream processing engine. No windowed aggregations or stream joins.
-- Not an event store. Publishes current state, not event history.
-- Not a global ordering system. Per-entity ordering in the change feed, no ordering in the task queue (honestly).
-- Not a broker replacement at scale. If you need 1M messages/second, use Kafka or Redpanda.
+Strunk is not a fit if you need:
+
+- **High-throughput stream processing.** Windowed aggregations, stream joins, sustained millions of messages per second. Use Kafka or Redpanda.
+- **Database mutation streaming (CDC).** Capturing every row change via logical decoding. Use Debezium or Sequin.
+- **Durable workflow orchestration.** Long-running sagas with compensation, timers, and human-in-the-loop steps. Use Temporal.
+- **Global total ordering.** Strunk orders per entity in the event stream and by priority in task queues. It does not provide a single global order across all messages.
+- **Event sourcing.** Strunk publishes current state, not a sequence of domain events that reconstruct state. If you need event replay to rebuild aggregates, this is the wrong model.
+
+The best use of Strunk is a Rust service (or small set of services) on PostgreSQL that needs reliable background work, domain state propagation, and transactional safety, without adopting a separate broker or workflow platform.
 
 ## Running the example
 

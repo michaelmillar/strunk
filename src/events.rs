@@ -1,6 +1,9 @@
 use std::future::Future;
 use std::time::Duration;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -8,9 +11,9 @@ use tracing::{debug, error, warn};
 
 use crate::error::Result;
 use crate::schema::SchemaRegistry;
-use crate::types::{Change, OutboxRow};
+use crate::types::{OutboxRow, StateEvent, TypedStateEvent};
 
-pub struct ChangePublish<'a> {
+pub struct EventPublish<'a> {
     tx: &'a mut Transaction<'static, Postgres>,
     entity_type: String,
     entity_id: String,
@@ -20,7 +23,7 @@ pub struct ChangePublish<'a> {
     registry: Option<&'a SchemaRegistry>,
 }
 
-impl<'a> ChangePublish<'a> {
+impl<'a> EventPublish<'a> {
     pub fn new(
         tx: &'a mut Transaction<'static, Postgres>,
         entity_type: impl Into<String>,
@@ -57,6 +60,11 @@ impl<'a> ChangePublish<'a> {
         self
     }
 
+    pub fn typed<T: Serialize>(mut self, data: &T) -> Self {
+        self.state = serde_json::to_value(data).expect("state serialisation failed");
+        self
+    }
+
     pub async fn publish(self) -> Result<i64> {
         if let Some(registry) = self.registry {
             registry.validate(&self.entity_type, &self.schema_version, &self.state)?;
@@ -76,7 +84,7 @@ impl<'a> ChangePublish<'a> {
         let id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO strunk_outbox (kind, key, payload, metadata)
-            VALUES ('change', $1, $2, $3)
+            VALUES ('event', $1, $2, $3)
             RETURNING id
             "#,
         )
@@ -125,6 +133,7 @@ pub struct Subscriber {
     pool: PgPool,
     id: String,
     entity_type: String,
+    database_url: Option<String>,
     schema_version: String,
     poll_interval: Duration,
     batch_size: i64,
@@ -137,6 +146,7 @@ impl Subscriber {
             pool,
             id: id.into(),
             entity_type: entity_type.into(),
+            database_url: None,
             schema_version: "1.0".to_string(),
             poll_interval: Duration::from_millis(100),
             batch_size: 100,
@@ -161,6 +171,11 @@ impl Subscriber {
 
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.token = token;
+        self
+    }
+
+    pub fn database_url(mut self, url: impl Into<String>) -> Self {
+        self.database_url = Some(url.into());
         self
     }
 
@@ -200,13 +215,13 @@ impl Subscriber {
         Ok(())
     }
 
-    async fn poll_changes(&self, after_id: i64) -> Result<Vec<OutboxRow>> {
+    async fn poll_events(&self, after_id: i64) -> Result<Vec<OutboxRow>> {
         let key_prefix = format!("{}:", self.entity_type);
 
         let rows = sqlx::query_as::<_, OutboxRow>(
             r#"
             SELECT * FROM strunk_outbox
-            WHERE kind = 'change'
+            WHERE kind = 'event'
             AND key LIKE $1 || '%'
             AND id > $2
             ORDER BY id
@@ -222,9 +237,26 @@ impl Subscriber {
         Ok(rows)
     }
 
+    pub fn spawn_typed<T, F, Fut>(self, handler: F) -> JoinHandle<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(TypedStateEvent<T>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>>
+            + Send,
+    {
+        self.spawn(move |event| {
+            let handler = handler.clone();
+            async move {
+                let typed = TypedStateEvent::try_from_event(event)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                handler(typed).await
+            }
+        })
+    }
+
     pub fn spawn<F, Fut>(self, handler: F) -> JoinHandle<()>
     where
-        F: Fn(Change) -> Fut + Send + Sync + 'static,
+        F: Fn(StateEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>>
             + Send,
     {
@@ -234,26 +266,44 @@ impl Subscriber {
                 return;
             }
 
+            let expected_prefix = format!("event:{}", self.entity_type);
+            let mut listener = match &self.database_url {
+                Some(url) => match PgListener::connect(url).await {
+                    Ok(mut l) => {
+                        if l.listen("strunk").await.is_ok() {
+                            Some(l)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+
             loop {
                 if self.token.is_cancelled() {
                     debug!(subscriber = %self.id, "subscriber shutting down");
                     return;
                 }
 
+                let mut processed_any = false;
+
                 match self.last_seen_id().await {
-                    Ok(cursor) => match self.poll_changes(cursor).await {
+                    Ok(cursor) => match self.poll_events(cursor).await {
                         Ok(rows) => {
                             if !rows.is_empty() {
+                                processed_any = true;
                                 debug!(
                                     count = rows.len(),
                                     subscriber = %self.id,
-                                    "processing changes"
+                                    "processing events"
                                 );
                             }
                             for row in rows {
                                 let row_id = row.id;
-                                let change = Change::from(row);
-                                match handler(change).await {
+                                let event = StateEvent::from(row);
+                                match handler(event).await {
                                     Ok(()) => {
                                         if let Err(e) = self.advance_cursor(row_id).await {
                                             error!(
@@ -269,7 +319,7 @@ impl Subscriber {
                                             error = %e,
                                             subscriber = %self.id,
                                             row_id,
-                                            "change handler failed, will retry"
+                                            "event handler failed, will retry"
                                         );
                                         break;
                                     }
@@ -285,11 +335,32 @@ impl Subscriber {
                     }
                 }
 
-                tokio::select! {
-                    _ = tokio::time::sleep(self.poll_interval) => {}
-                    _ = self.token.cancelled() => {
-                        debug!(subscriber = %self.id, "subscriber shutting down");
-                        return;
+                if processed_any {
+                    continue;
+                }
+
+                if let Some(ref mut l) = listener {
+                    tokio::select! {
+                        notification = l.recv() => {
+                            if let Ok(n) = notification {
+                                if !n.payload().starts_with(&expected_prefix) {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                        _ = self.token.cancelled() => {
+                            debug!(subscriber = %self.id, "subscriber shutting down");
+                            return;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                        _ = self.token.cancelled() => {
+                            debug!(subscriber = %self.id, "subscriber shutting down");
+                            return;
+                        }
                     }
                 }
             }

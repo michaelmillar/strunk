@@ -86,6 +86,13 @@ impl Reaper {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        sqlx::query(
+            "DELETE FROM strunk_inbox WHERE processed_at < now() - make_interval(secs => $1::double precision)",
+        )
+        .bind(self.retention_delivered.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+
         Ok(total)
     }
 

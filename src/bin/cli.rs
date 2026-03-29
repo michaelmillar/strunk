@@ -6,7 +6,7 @@ use strunk::Strunk;
 use tabled::{Table, Tabled};
 
 #[derive(Parser)]
-#[command(name = "strunk", about = "Omit needless infrastructure.")]
+#[command(name = "strunk", about = "Durable task queues and state events for PostgreSQL.")]
 struct Cli {
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
@@ -51,6 +51,16 @@ enum Command {
     },
 
     Health,
+
+    Replay {
+        subscriber_id: String,
+        #[arg(long, default_value = "0")]
+        from: i64,
+    },
+
+    ResetSubscriber {
+        subscriber_id: String,
+    },
 }
 
 #[derive(Tabled)]
@@ -216,6 +226,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("subscriber '{}' not found", subscriber_id);
                 }
             }
+        }
+
+        Command::Replay { subscriber_id, from } => {
+            strunk.replay_subscriber(&subscriber_id, from).await?;
+            println!("subscriber '{}' cursor set to {}", subscriber_id, from);
+        }
+
+        Command::ResetSubscriber { subscriber_id } => {
+            strunk.reset_subscriber(&subscriber_id).await?;
+            println!("subscriber '{}' reset to beginning", subscriber_id);
         }
 
         Command::Health => {

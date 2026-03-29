@@ -1,14 +1,17 @@
 use std::future::Future;
 use std::time::Duration;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::postgres::PgListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::error::Result;
 use crate::relay;
-use crate::types::{OutboxRow, Task};
+use crate::types::{OutboxRow, Task, TypedTask};
 
 pub struct TaskSubmit<'a> {
     tx: &'a mut Transaction<'static, Postgres>,
@@ -62,6 +65,11 @@ impl<'a> TaskSubmit<'a> {
 
     pub fn dedup_key(mut self, key: impl Into<String>) -> Self {
         self.dedup_key = Some(key.into());
+        self
+    }
+
+    pub fn typed<T: Serialize>(mut self, data: &T) -> Self {
+        self.payload = serde_json::to_value(data).expect("payload serialisation failed");
         self
     }
 
@@ -310,14 +318,38 @@ pub async fn get_progress(pool: &PgPool, task_id: i64) -> Result<Option<i16>> {
     Ok(row)
 }
 
+pub async fn inbox_contains(pool: &PgPool, consumer_id: &str, message_id: i64) -> Result<bool> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM strunk_inbox WHERE consumer_id = $1 AND message_id = $2",
+    )
+    .bind(consumer_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+pub async fn inbox_mark(pool: &PgPool, consumer_id: &str, message_id: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO strunk_inbox (consumer_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(consumer_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub struct Worker {
     pool: PgPool,
     queue: String,
+    database_url: Option<String>,
     concurrency: usize,
     visibility_timeout: Duration,
     poll_interval: Duration,
     token: CancellationToken,
     middleware: Option<std::sync::Arc<dyn Middleware>>,
+    inbox_id: Option<String>,
 }
 
 impl Worker {
@@ -325,11 +357,13 @@ impl Worker {
         Self {
             pool,
             queue: queue.into(),
+            database_url: None,
             concurrency: 1,
             visibility_timeout: Duration::from_secs(30),
             poll_interval: Duration::from_millis(100),
             token: CancellationToken::new(),
             middleware: None,
+            inbox_id: None,
         }
     }
 
@@ -358,6 +392,32 @@ impl Worker {
         self
     }
 
+    pub fn database_url(mut self, url: impl Into<String>) -> Self {
+        self.database_url = Some(url.into());
+        self
+    }
+
+    pub fn inbox(mut self, consumer_id: impl Into<String>) -> Self {
+        self.inbox_id = Some(consumer_id.into());
+        self
+    }
+
+    pub fn spawn_typed<T, F, Fut>(self, handler: F) -> Vec<JoinHandle<()>>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(TypedTask<T>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+    {
+        self.spawn(move |task| {
+            let handler = handler.clone();
+            async move {
+                let typed = TypedTask::try_from_task(task)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                handler(typed).await
+            }
+        })
+    }
+
     pub fn spawn<F, Fut>(self, handler: F) -> Vec<JoinHandle<()>>
     where
         F: Fn(Task) -> Fut + Send + Sync + Clone + 'static,
@@ -368,13 +428,30 @@ impl Worker {
         for worker_id in 0..self.concurrency {
             let pool = self.pool.clone();
             let queue = self.queue.clone();
+            let database_url = self.database_url.clone();
             let handler = handler.clone();
             let visibility_timeout = self.visibility_timeout;
             let poll_interval = self.poll_interval;
             let token = self.token.clone();
             let middleware = self.middleware.clone();
+            let inbox_id = self.inbox_id.clone();
 
             let handle = tokio::spawn(async move {
+                let expected_prefix = format!("task:{}", queue);
+                let mut listener = match &database_url {
+                    Some(url) => match PgListener::connect(url).await {
+                        Ok(mut l) => {
+                            if l.listen("strunk").await.is_ok() {
+                                Some(l)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+
                 loop {
                     if token.is_cancelled() {
                         debug!(worker_id, queue = %queue, "worker shutting down");
@@ -384,8 +461,18 @@ impl Worker {
                     match claim(&pool, &queue, visibility_timeout).await {
                         Ok(Some(task)) => {
                             let task_id = task.id;
-                            let max_retries = task.attempts;
+                            let max_retries = task.max_retries;
                             let attempts = task.attempts;
+
+                            if let Some(ref cid) = inbox_id {
+                                if inbox_contains(&pool, cid, task_id).await.unwrap_or(false) {
+                                    debug!(task_id, "skipping already-processed task (inbox)");
+                                    if let Err(e) = complete(&pool, task_id).await {
+                                        error!(task_id, error = %e, "failed to mark inbox-skipped task complete");
+                                    }
+                                    continue;
+                                }
+                            }
 
                             if let Some(ref mw) = middleware {
                                 mw.before(&task);
@@ -395,6 +482,11 @@ impl Worker {
 
                             match handler(task).await {
                                 Ok(()) => {
+                                    if let Some(ref cid) = inbox_id {
+                                        if let Err(e) = inbox_mark(&pool, cid, task_id).await {
+                                            error!(task_id, error = %e, "failed to mark inbox");
+                                        }
+                                    }
                                     if let Some(ref mw) = middleware {
                                         mw.after_success(task_id, start.elapsed());
                                     }
@@ -414,11 +506,28 @@ impl Worker {
                             }
                         }
                         Ok(None) => {
-                            tokio::select! {
-                                _ = tokio::time::sleep(poll_interval) => {}
-                                _ = token.cancelled() => {
-                                    debug!(worker_id, queue = %queue, "worker shutting down");
-                                    return;
+                            if let Some(ref mut l) = listener {
+                                tokio::select! {
+                                    notification = l.recv() => {
+                                        if let Ok(n) = notification {
+                                            if !n.payload().starts_with(&expected_prefix) {
+                                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                            }
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(poll_interval) => {}
+                                    _ = token.cancelled() => {
+                                        debug!(worker_id, queue = %queue, "worker shutting down");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(poll_interval) => {}
+                                    _ = token.cancelled() => {
+                                        debug!(worker_id, queue = %queue, "worker shutting down");
+                                        return;
+                                    }
                                 }
                             }
                         }

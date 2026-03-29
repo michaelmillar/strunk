@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -6,7 +7,7 @@ use sqlx::FromRow;
 #[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum MessageKind {
     Task,
-    Change,
+    Event,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -71,7 +72,7 @@ pub struct TaskResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct Change {
+pub struct StateEvent {
     pub id: i64,
     pub entity_type: String,
     pub entity_id: String,
@@ -80,7 +81,57 @@ pub struct Change {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<OutboxRow> for Change {
+#[derive(Debug, Clone)]
+pub struct TypedTask<T> {
+    pub id: i64,
+    pub queue: String,
+    pub data: T,
+    pub metadata: serde_json::Value,
+    pub attempts: i32,
+    pub max_retries: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+impl<T: DeserializeOwned> TypedTask<T> {
+    pub fn try_from_task(task: Task) -> std::result::Result<Self, serde_json::Error> {
+        let data = serde_json::from_value(task.payload)?;
+        Ok(Self {
+            id: task.id,
+            queue: task.queue,
+            data,
+            metadata: task.metadata,
+            attempts: task.attempts,
+            max_retries: task.max_retries,
+            created_at: task.created_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedStateEvent<T> {
+    pub id: i64,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub data: T,
+    pub diff: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl<T: DeserializeOwned> TypedStateEvent<T> {
+    pub fn try_from_event(event: StateEvent) -> std::result::Result<Self, serde_json::Error> {
+        let data = serde_json::from_value(event.state)?;
+        Ok(Self {
+            id: event.id,
+            entity_type: event.entity_type,
+            entity_id: event.entity_id,
+            data,
+            diff: event.diff,
+            created_at: event.created_at,
+        })
+    }
+}
+
+impl From<OutboxRow> for StateEvent {
     fn from(row: OutboxRow) -> Self {
         let (entity_type, entity_id) = row
             .key

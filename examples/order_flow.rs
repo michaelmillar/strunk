@@ -47,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
 
     println!("submitted task {}", task_id);
 
-    let change_id = strunk
-        .change(&mut tx, "order", "42")
+    let event_id = strunk
+        .event(&mut tx, "order", "42")
         .state(serde_json::json!({
             "id": 42,
             "status": "confirmed",
@@ -60,10 +60,10 @@ async fn main() -> anyhow::Result<()> {
         .publish()
         .await?;
 
-    println!("published change {}", change_id);
+    println!("published event {}", event_id);
 
     tx.commit().await?;
-    println!("transaction committed: task and change are now visible");
+    println!("transaction committed: task and event are now visible");
 
     let worker_handles = strunk
         .worker("email-notifications")
@@ -79,10 +79,10 @@ async fn main() -> anyhow::Result<()> {
 
     let _subscriber = strunk
         .subscriber("search-indexer", "order")
-        .spawn(|change| async move {
+        .spawn(|event| async move {
             println!(
                 "order {} is now: {}",
-                change.entity_id, change.state
+                event.entity_id, event.state
             );
             Ok(())
         });

@@ -267,7 +267,7 @@ async fn subscriber_resumes_from_cursor() {
 
     for i in 0..5 {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "item", &i.to_string())
+        strunk.event(&mut tx, "item", &i.to_string())
             .state(serde_json::json!({"id": i, "name": format!("item-{}", i)}))
             .schema_version("1.0")
             .publish().await.unwrap();
@@ -279,10 +279,10 @@ async fn subscriber_resumes_from_cursor() {
 
     let sub = strunk.subscriber("cursor-test", "item")
         .poll_interval(Duration::from_millis(50))
-        .spawn(move |change| {
+        .spawn(move |event| {
             let seen = seen_clone.clone();
             async move {
-                seen.lock().await.push(change.entity_id.clone());
+                seen.lock().await.push(event.entity_id.clone());
                 Ok(())
             }
         });
@@ -295,7 +295,7 @@ async fn subscriber_resumes_from_cursor() {
 
     for i in 5..8 {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "item", &i.to_string())
+        strunk.event(&mut tx, "item", &i.to_string())
             .state(serde_json::json!({"id": i, "name": format!("item-{}", i)}))
             .schema_version("1.0")
             .publish().await.unwrap();
@@ -307,10 +307,10 @@ async fn subscriber_resumes_from_cursor() {
 
     let sub2 = strunk.subscriber("cursor-test", "item")
         .poll_interval(Duration::from_millis(50))
-        .spawn(move |change| {
+        .spawn(move |event| {
             let seen = seen2_clone.clone();
             async move {
-                seen.lock().await.push(change.entity_id.clone());
+                seen.lock().await.push(event.entity_id.clone());
                 Ok(())
             }
         });
@@ -323,7 +323,7 @@ async fn subscriber_resumes_from_cursor() {
 }
 
 #[tokio::test]
-async fn change_feed_ordering_per_entity() {
+async fn event_feed_ordering_per_entity() {
     let Some(mut strunk) = setup().await else { return };
 
     strunk.register_schema("counter", "1.0", &serde_json::json!({
@@ -333,7 +333,7 @@ async fn change_feed_ordering_per_entity() {
 
     for i in 0..10 {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "counter", "1")
+        strunk.event(&mut tx, "counter", "1")
             .state(serde_json::json!({"value": i}))
             .schema_version("1.0")
             .publish().await.unwrap();
@@ -345,10 +345,10 @@ async fn change_feed_ordering_per_entity() {
 
     let sub = strunk.subscriber("order-test", "counter")
         .poll_interval(Duration::from_millis(50))
-        .spawn(move |change| {
+        .spawn(move |event| {
             let values = values_clone.clone();
             async move {
-                values.lock().await.push(change.state["value"].as_i64().unwrap());
+                values.lock().await.push(event.state["value"].as_i64().unwrap());
                 Ok(())
             }
         });
@@ -376,7 +376,7 @@ async fn schema_type_mismatch_rejected() {
     })).unwrap();
 
     let mut tx = strunk.begin().await.unwrap();
-    let result = strunk.change(&mut tx, "typed", "1")
+    let result = strunk.event(&mut tx, "typed", "1")
         .state(serde_json::json!({"count": "not_a_number", "name": "test"}))
         .schema_version("1.0")
         .publish().await;
@@ -441,7 +441,7 @@ async fn snapshot_returns_latest_state() {
 
     for v in 1..=5 {
         let mut tx = strunk.begin().await.unwrap();
-        strunk.change(&mut tx, "doc", "1")
+        strunk.event(&mut tx, "doc", "1")
             .state(serde_json::json!({"version": v}))
             .schema_version("1.0")
             .publish().await.unwrap();
